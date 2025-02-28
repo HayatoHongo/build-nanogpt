@@ -31,15 +31,15 @@ import requests
 import tiktoken
 from tqdm import tqdm
 import torch
-import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
+import torch.distributed as dist  # 分散処理用
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
 
-def download_file(url: str, fname: str, chunk_size=1024):
-    """Helper function to download a file from a given url"""
+def download_file(url: str, fname: str, chunk_size: int = 1024) -> None:
+    """Helper function to download a file from a given URL."""
     resp = requests.get(url, stream=True)
     total = int(resp.headers.get("content-length", 0))
     with open(fname, "wb") as file, tqdm(
@@ -61,16 +61,32 @@ hellaswags = {
 
 enc = tiktoken.get_encoding("gpt2")
 
-def download(split):
-    """Downloads HellaSwag DATA_CACHE_DIR"""
+def download(split: str) -> None:
+    """
+    Downloads HellaSwag data into DATA_CACHE_DIR.
+    分散処理（DDP）の場合、rank 0 のみがダウンロードを実施し、他プロセスは barrier で待機する。
+    """
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
     data_url = hellaswags[split]
     data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
-    if not os.path.exists(data_filename):
-        print(f"Downloading {data_url} to {data_filename}...")
-        download_file(data_url, data_filename)
+    
+    # 分散環境かどうかチェック
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() == 0:
+            if not os.path.exists(data_filename):
+                print(f"Downloading {data_url} to {data_filename}...")
+                download_file(data_url, data_filename)
+            else:
+                print(f"{data_filename} already exists (downloaded by master).")
+        dist.barrier()  # 全プロセスがここで待機
+    else:
+        if not os.path.exists(data_filename):
+            print(f"Downloading {data_url} to {data_filename}...")
+            download_file(data_url, data_filename)
+        else:
+            print(f"{data_filename} already exists.")
 
-def render_example(example):
+def render_example(example: dict):
     """
     Given the example as a dictionary, render it as three torch tensors:
     - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
@@ -81,25 +97,23 @@ def render_example(example):
     label = example["label"]
     endings = example["endings"]
 
-    # data needed to reproduce this eval on the C size
     data = {
         "label": label,
         "ctx_tokens": None,
         "ending_tokens": [],
     }
 
-    # gather up all the tokens
     ctx_tokens = enc.encode(ctx)
     data["ctx_tokens"] = ctx_tokens
     tok_rows = []
     mask_rows = []
     for end in endings:
-        end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
+        # Prepend a space so that GPT-2 tokenizer treats it properly
+        end_tokens = enc.encode(" " + end)
         tok_rows.append(ctx_tokens + end_tokens)
-        mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens))
+        mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_tokens))
         data["ending_tokens"].append(end_tokens)
 
-    # have to be careful during the collation because the number of tokens in each row can differ
     max_len = max(len(row) for row in tok_rows)
     tokens = torch.zeros((4, max_len), dtype=torch.long)
     mask = torch.zeros((4, max_len), dtype=torch.long)
@@ -109,21 +123,27 @@ def render_example(example):
 
     return data, tokens, mask, label
 
-def iterate_examples(split):
-    # there are 10,042 examples in total in val
+def iterate_examples(split: str):
+    """
+    Generator that yields examples from the HellaSwag JSONL file.
+    ファイルは download() により、必要に応じてダウンロードされる。
+    """
     download(split)
-    with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
+    filepath = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             example = json.loads(line)
             yield example
 
 @torch.no_grad()
-def evaluate(model_type, device):
-
-    torch.set_float32_matmul_precision('high') # use tf32
+def evaluate(model_type: str, device: str):
+    """
+    Evaluates a given GPT-2 model on HellaSwag.
+    """
+    torch.set_float32_matmul_precision('high')  # use tf32
     model = GPT2LMHeadModel.from_pretrained(model_type)
     model.to(device)
-    # model = torch.compile(model) # optionally torch compile the model
+    # Optionally: model = torch.compile(model)
 
     num_correct_norm = 0
     num_correct = 0
@@ -133,37 +153,32 @@ def evaluate(model_type, device):
         tokens = tokens.to(device)
         mask = mask.to(device)
 
-        # get the logits
         logits = model(tokens).logits
-        # evaluate the autoregressive loss at all positions
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_tokens = tokens[..., 1:].contiguous()
         flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
         flat_shift_tokens = shift_tokens.view(-1)
         shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
         shift_losses = shift_losses.view(tokens.size(0), -1)
-        # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+
+        shift_mask = mask[..., 1:].contiguous()
         masked_shift_losses = shift_losses * shift_mask
-        # sum and divide by the number of 1s in the mask
         sum_loss = masked_shift_losses.sum(dim=1)
         avg_loss = sum_loss / shift_mask.sum(dim=1)
-        # now we have a loss for each of the 4 completions
-        # the one with the lowest loss should be the most likely
+
         pred = sum_loss.argmin().item()
         pred_norm = avg_loss.argmin().item()
 
-        # accumulate stats
         num_total += 1
         num_correct += int(pred == label)
         num_correct_norm += int(pred_norm == label)
         print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
 
-        # debug: pretty print a few examples, and the losses in each case
         if num_total < 10:
             print("---")
             print(f"Context:\n {example['ctx']}")
-            print(f"Endings:")
+            print("Endings:")
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
             print(f"predicted: {pred_norm}, actual: {label}")
