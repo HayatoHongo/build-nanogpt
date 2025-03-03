@@ -8,34 +8,16 @@ import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 # -----------------------------------------------------------------------------
-# GPT-2 の Conv1D の挙動を再現するためのモジュール
-class Conv1D(nn.Module):
-    def __init__(self, n_out, n_in):
-        super().__init__()
-        # GPT2 の場合、重みは (n_in, n_out) の形状で保存される
-        self.weight = nn.Parameter(torch.empty(n_in, n_out))
-        self.bias = nn.Parameter(torch.zeros(n_out))
-        self.reset_parameters()
-    
-    def reset_parameters(self):
-        nn.init.normal_(self.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.bias)
-    
-    def forward(self, x):
-        # x: (batch, sequence_length, n_in)
-        return torch.matmul(x, self.weight) + self.bias
 
-# -----------------------------------------------------------------------------
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        # 変更: nn.Linear -> Conv1D (Conv1D(weight shape: [n_in, n_out]) なので引数の順番に注意)
-        self.c_attn = Conv1D(3 * config.n_embd, config.n_embd)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
-        self.c_proj = Conv1D(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
@@ -61,10 +43,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        # 変更: nn.Linear -> Conv1D
-        self.c_fc    = Conv1D(4 * config.n_embd, config.n_embd)
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
-        self.c_proj  = Conv1D(config.n_embd, 4 * config.n_embd)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -116,7 +97,7 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, Conv1D)):
+        if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
@@ -162,7 +143,7 @@ class GPT(nn.Module):
         }[model_type]
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model (Conv1D を利用するように変更済み)
+        # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
@@ -178,12 +159,21 @@ class GPT(nn.Module):
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # GPT-2 のチェックポイントは Conv1D を前提としているので、転置処理は不要
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
-            assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch for {k}: {sd_hf[k].shape} != {sd[k].shape}"
-            with torch.no_grad():
-                sd[k].copy_(sd_hf[k])
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
@@ -350,7 +340,7 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50257))
+model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
