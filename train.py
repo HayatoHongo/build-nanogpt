@@ -331,10 +331,10 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 32768 # 2**16, ~0.5M, in number of tokens for 1 A100 GPU
-# total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens for 8 A100 GPUs
-B = 32 # micro batch size for 1 A100 GPU
-# B = 64 # micro batch size for 8 A100 GPUs
+# total_batch_size = 32768 # 2**16, ~0.5M, in number of tokens for 1 A100 GPU
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens for 8 A100 GPUs
+# B = 32 # micro batch size for 1 A100 GPU
+B = 64 # micro batch size for 8 A100 GPUs
 T = 1024 # sequence length for each micro batch
 
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"

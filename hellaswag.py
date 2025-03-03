@@ -6,22 +6,6 @@ Example HellaSwag json item:
 
 {"ind": 24, "activity_label": "Roof shingle removal", "ctx_a": "A man is sitting on a roof.", "ctx_b": "he", "ctx": "A man is sitting on a roof. he", "split": "val", "split_type": "indomain", "label": 3, "endings": ["is using wrap to wrap a pair of skis.", "is ripping level tiles off.", "is holding a rubik's cube.", "starts pulling up roofing on a roof."], "source_id": "activitynet~v_-JhWjGDPHMY"}
 
-ind: dataset ID
-activity_label: The ActivityNet or WikiHow label for this example
-context: There are two formats. The full context is in ctx. When the context ends in an (incomplete) noun phrase, like for ActivityNet, this incomplete noun phrase is in ctx_b, and the context up until then is in ctx_a. This can be useful for models such as BERT that need the last sentence to be complete. However, it's never required. If ctx_b is nonempty, then ctx is the same thing as ctx_a, followed by a space, then ctx_b.
-endings: a list of 4 endings. The correct index is given by label (0,1,2, or 3)
-split: train, val, or test.
-split_type: indomain if the activity label is seen during training, else zeroshot
-source_id: Which video or WikiHow article this example came from
-
-gpt2 (124M)
-- eleuther harness reports acc 28.92%, acc_norm 31.14% (multiple choice style)
-- this script: 10042 acc: 0.2859 acc_norm: 0.2955 (completion style)
-
-gpt2-xl (1558M)
-- eleuther harness reports acc 40.04%, acc_norm 50.89% (multiple choice style)
-- this script: 10042 acc: 0.3842 acc_norm: 0.4893 (completion style)
-
 The validation set of HellaSwag has a total of 10,042 examples.
 """
 
@@ -43,7 +27,7 @@ def download_file(url: str, fname: str, chunk_size: int = 1024) -> None:
     resp = requests.get(url, stream=True)
     total = int(resp.headers.get("content-length", 0))
     with open(fname, "wb") as file, tqdm(
-        desc=fname,
+        desc=f"Downloading {os.path.basename(fname)}",
         total=total,
         unit="iB",
         unit_scale=True,
@@ -70,19 +54,28 @@ def download(split: str) -> None:
     data_url = hellaswags[split]
     data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
     
-    # 分散環境かどうかチェック
     if dist.is_available() and dist.is_initialized():
-        if dist.get_rank() == 0:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        print(f"[Rank {rank}/{world_size}] Starting download() for split '{split}'.")
+        if rank == 0:
             if not os.path.exists(data_filename):
-                print(f"Downloading {data_url} to {data_filename}...")
+                print(f"[MASTER] Downloading {data_url} to {data_filename}...")
                 download_file(data_url, data_filename)
+                print(f"[MASTER] Download completed: {data_filename}")
             else:
-                print(f"{data_filename} already exists (downloaded by master).")
+                print(f"[MASTER] {data_filename} already exists (downloaded earlier).")
+        else:
+            print(f"[Rank {rank}] Waiting for master to download {data_filename}...")
         dist.barrier()  # 全プロセスがここで待機
+        if rank != 0:
+            print(f"[Rank {rank}] Download confirmed, resuming execution.")
     else:
+        # 分散環境でない場合
         if not os.path.exists(data_filename):
             print(f"Downloading {data_url} to {data_filename}...")
             download_file(data_url, data_filename)
+            print("Download completed.")
         else:
             print(f"{data_filename} already exists.")
 
@@ -130,6 +123,7 @@ def iterate_examples(split: str):
     """
     download(split)
     filepath = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
+    print(f"Reading examples from {filepath} ...")
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             example = json.loads(line)
@@ -141,6 +135,7 @@ def evaluate(model_type: str, device: str):
     Evaluates a given GPT-2 model on HellaSwag.
     """
     torch.set_float32_matmul_precision('high')  # use tf32
+    print(f"Loading model '{model_type}' on device {device}...")
     model = GPT2LMHeadModel.from_pretrained(model_type)
     model.to(device)
     # Optionally: model = torch.compile(model)
@@ -173,7 +168,7 @@ def evaluate(model_type: str, device: str):
         num_total += 1
         num_correct += int(pred == label)
         num_correct_norm += int(pred_norm == label)
-        print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
+        print(f"[Example {num_total}] acc_norm: {num_correct_norm}/{num_total} = {num_correct_norm/num_total:.4f}")
 
         if num_total < 10:
             print("---")
@@ -181,7 +176,7 @@ def evaluate(model_type: str, device: str):
             print("Endings:")
             for i, end in enumerate(example["endings"]):
                 print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
-            print(f"predicted: {pred_norm}, actual: {label}")
+            print(f"Predicted: {pred_norm}, Actual: {label}")
 
 if __name__ == "__main__":
     import argparse
@@ -189,4 +184,8 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model_type", type=str, default="gpt2", help="the model type to use")
     parser.add_argument("-d", "--device", type=str, default="cuda", help="the device to use")
     args = parser.parse_args()
+
+    # 分散環境の場合、各プロセスの情報をログ出力
+    if dist.is_available() and dist.is_initialized():
+        print(f"[Rank {dist.get_rank()}] LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'N/A')}, WORLD_SIZE: {os.environ.get('WORLD_SIZE', 'N/A')}")
     evaluate(args.model_type, args.device)
